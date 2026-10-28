@@ -584,6 +584,82 @@ def _clamp(v, lo=0, hi=100):
 
 # ===========================================================================
 # 各策略?# ===========================================================================
+def sc525_read(iface: HidIface, timeout: float = 1.0) -> Optional[Reading]:
+    """SC525 / HS6219 2.4G 接收器协议。
+
+    这类接收器（VID 0x32C2 等）在 usage page 0xFF0F 的厂商集合上用
+    「16 字节输出 / 32 字节输入」的成对报文：
+
+        写  0E 20 00 00 ... (16 字节，0x0E 是 Report ID，0x20 是命令)
+        读  0E 20 03 13 20 07 10 00 64 0C 00 ... (32 字节)
+
+    回复的第 1 字节回显命令，第 2 字节是电量状态，第 8 字节是电量百分比。
+    同一个报文接收器也会主动推送（不询问也会收到），所以先被动读、再主动问，
+    两边都能拿到。协议细节参考 AULA Desk 项目记录的 SC525 报文格式。
+
+    实测（HS6219 / 2.4G Wireless Receiver，VID 0x32C2 PID 0x0027）：
+        0E 20 03 13 20 07 10 00 64 0C 00 ...
+        ^^ ^^ ^^                ^^  ^^
+        |  |  |                |   +-- 状态字节（12 = 0x0C）
+        |  |  |                +------ 电量百分比 = 100
+        |  |  +----------------------- 长度/参数
+        |  +-------------------------- 电量状态（3 = 充满）
+        +----------------------------- 命令 0x20
+    """
+    if iface.vid != 0x32C2 or iface.input_len < 32 or iface.output_len < 16:
+        return None
+    dev = None
+    try:
+        dev = HidDevice(iface.path, write=True)
+    except HidError as e:
+        return Reading(ok=False, source="SC525 协议", detail=str(e))
+
+    def parse(rep: bytes) -> Optional[Reading]:
+        if not rep or len(rep) < 9 or rep[0] != 0x0E:
+            return None
+        level = rep[8]
+        if level > 100:
+            return None
+        status = rep[2]
+        # HID 电池状态：0=放电 1=充电 2=未充电 3=充满
+        state = {0: "discharging", 1: "charging", 2: "not_charging",
+                 3: "full"}.get(status, "unknown")
+        return Reading(ok=True, level=_clamp(level),
+                       status="charging" if status == 1 else
+                       ("full" if status == 3 else "discharging"),
+                       source="SC525 协议（0xFF0F，命令 0x20）",
+                       detail=f"状态 {status}（{state}）回复 {rep[:12].hex(' ')}",
+                       raw=rep)
+
+    try:
+        # 先被动收：接收器自己也会推送同一份状态报文
+        deadline = time.monotonic() + 0.4
+        while time.monotonic() < deadline:
+            rep = dev.read_input(iface.input_len, 150)
+            if not rep:
+                continue
+            r = parse(rep)
+            if r:
+                return r
+        # 再主动问一次
+        dev.drain()
+        dev.write_output(bytes([0x0E, 0x20]) + bytes(iface.output_len - 2))
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            rep = dev.read_input(iface.input_len, 250)
+            if not rep:
+                continue
+            r = parse(rep)
+            if r:
+                return r
+        return Reading(ok=False, source="SC525 协议",
+                       detail="没有收到电量回复（鼠标可能休眠，动一下鼠标再试）")
+    except HidError as e:
+        return Reading(ok=False, source="SC525 协议", detail=str(e))
+    finally:
+        dev.close()
+
+
 def read_standard_battery(iface: HidIface) -> Optional[Reading]:
     if not iface.feature_len:
         return None
@@ -924,9 +1000,6 @@ DEVICES = [
 
 
 def read_mouse(ifaces: list[HidIface]) -> Reading:
-    # 测试：临时忘记鼠标（VID/PID 与协讼
-    return Reading(ok=False, name="", source="", present=False,
-                   detail="已临时忘记该设备")
     spec = DEVICES[0]
     cands = [d for d in ifaces if (d.vid, d.pid) in spec.ids]
     if not cands:
@@ -960,9 +1033,6 @@ def read_mouse(ifaces: list[HidIface]) -> Reading:
 
 
 def read_headset(ifaces: list[HidIface]) -> Reading:
-    # 测试：临时忘记机（VID/PID 与协讼
-    return Reading(ok=False, name="", source="", present=False,
-                   detail="已临时忘记该设备")
     spec = DEVICES[1]
     cands = [d for d in ifaces if (d.vid, d.pid) in spec.ids]
     if not cands:
@@ -1103,7 +1173,17 @@ def read_saved_device(dev: dict, ifaces=None) -> Reading:
                     r = rr
             except Exception:
                 pass
-    elif proto is None:
+    if not r or not r.ok:
+        # SC525 接收器（VID 0x32C2 等）：厂商私有协议，需要单独一条路
+        for d in cand:
+            try:
+                rr = sc525_read(d)
+            except Exception:
+                rr = None
+            if rr is not None and rr.ok and rr.level is not None:
+                r = rr
+                break
+    if r is not None and r.ok and proto is None and not r.source.startswith("SC525"):
         # 标准 HID 能直接读：保存成协议，之后休眠也算“有协议”
         save_standard_protocol(vid, pid)
     supported = key in user_protocols()
@@ -1139,6 +1219,15 @@ def _unknown_reading(name: str, ifaces: list[HidIface],
         if r and r.ok and r.level is not None:
             r.name = name
             r.source = "标准 HID 电量"
+            return r
+    # SC525 接收器（VID 0x32C2 等）：自己的协议，不走兼容分支，两种路径都要试
+    for d in ifaces:
+        try:
+            r = sc525_read(d)
+        except Exception:
+            r = None
+        if r is not None and r.ok and r.level is not None:
+            r.name = name
             return r
     if not skip_compat:
         for d in ifaces:
