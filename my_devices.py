@@ -1104,6 +1104,23 @@ def has_device_protocol(vid: int, pid: int) -> bool:
     return f"{vid:04X}:{pid:04X}" in user_protocols()
 
 
+def save_sc525_protocol(vid: int, pid: int) -> None:
+    """记住这个设备走 SC525 厂商协议。
+
+    存了协议之后，设备读不到时按“休眠”处理：沿用上次的电量，
+    托盘图标不会因为一次读取失败就整块消失。
+    """
+    key = f"{vid:04X}:{pid:04X}"
+    cfg = load_config()
+    protos = cfg.get("protocols")
+    if not isinstance(protos, dict):
+        protos = {}
+    if protos.get(key, {}).get("kind") != "sc525":
+        protos[key] = {"kind": "sc525"}
+        cfg["protocols"] = protos
+        save_config(cfg)
+
+
 def save_standard_protocol(vid: int, pid: int) -> None:
     key = f"{vid:04X}:{pid:04X}"
     cfg = load_config()
@@ -1152,29 +1169,32 @@ def read_saved_device(dev: dict, ifaces=None) -> Reading:
     prod = next((d.product for d in cand if d.product), "")
     if not name:
         name = prod or f"{vid:04X}:{pid:04X}"
-    # 只允许两条路：标准 HID 直接读，或抓包保存的协议。
-    # 不再做厂商兼容试探，也不再按 VID/PID 匹配内置设备。
-    r = None
-    for d in cand:
-        try:
-            rr = read_standard_battery(d)
-        except Exception:
-            rr = None
-        if rr and rr.ok and rr.level is not None:
-            r = rr
-            break
     key = f"{vid:04X}:{pid:04X}"
     proto = user_protocols().get(key)
-    if not r or not r.ok:
-        if proto is not None and proto.get("kind", "captured") != "standard":
+    kind = (proto or {}).get("kind", "captured")
+    r = None
+    if kind != "sc525":
+        # 标准 HID 直接读
+        for d in cand:
             try:
-                rr = _read_user_protocol(cand, proto)
-                if rr and rr.ok:
-                    r = rr
+                rr = read_standard_battery(d)
             except Exception:
-                pass
+                rr = None
+            if rr and rr.ok and rr.level is not None:
+                r = rr
+                break
+        if not r or not r.ok:
+            # 抓包保存的协议
+            if proto is not None and kind != "standard":
+                try:
+                    rr = _read_user_protocol(cand, proto)
+                    if rr and rr.ok:
+                        r = rr
+                except Exception:
+                    pass
     if not r or not r.ok:
         # SC525 接收器（VID 0x32C2 等）：厂商私有协议，需要单独一条路
+        sc525_fail = None
         for d in cand:
             try:
                 rr = sc525_read(d)
@@ -1183,9 +1203,17 @@ def read_saved_device(dev: dict, ifaces=None) -> Reading:
             if rr is not None and rr.ok and rr.level is not None:
                 r = rr
                 break
-    if r is not None and r.ok and proto is None and not r.source.startswith("SC525"):
-        # 标准 HID 能直接读：保存成协议，之后休眠也算“有协议”
-        save_standard_protocol(vid, pid)
+            if rr is not None and sc525_fail is None:
+                sc525_fail = rr
+    else:
+        sc525_fail = None
+    if r is not None and r.ok and proto is None:
+        # 记住这个设备走的是哪条协议：以后读不到时按“休眠”处理，
+        # 托盘图标保留上次电量，而不是整块消失
+        if r.source.startswith("SC525"):
+            save_sc525_protocol(vid, pid)
+        else:
+            save_standard_protocol(vid, pid)
     supported = key in user_protocols()
     if r is None:
         r = Reading(
@@ -1193,12 +1221,20 @@ def read_saved_device(dev: dict, ifaces=None) -> Reading:
             status="asleep" if supported else "unknown_proto",
             detail=("设备休眠" if supported
                     else "协议未知，无法读取电量"))
+        if sc525_fail is not None and sc525_fail.detail:
+            # 保留 SC525 的失败原因（例如“鼠标可能休眠”），比笼统的“设备休眠”有用
+            r.detail = sc525_fail.detail
+            r.source = sc525_fail.source
     elif not r.ok and supported:
         r.status = "asleep"
-        r.source = ("标准 HID 电量"
-                    if proto is not None and proto.get("kind") == "standard"
-                    else "抓包协议")
-        r.detail = "设备休眠"
+        if kind == "standard":
+            r.source = "标准 HID 电量"
+        elif kind == "sc525":
+            r.source = "SC525 协议（0xFF0F，命令 0x20）"
+        else:
+            r.source = "抓包协议"
+        if not r.detail:
+            r.detail = "设备休眠"
     r.name = name
     r.present = True
     meta = next((d for d in cand if d.usage_page >= 0xFF00), cand[0])
@@ -4672,6 +4708,12 @@ class Tray:
             return
         self._add_icons()
         user32.SetTimer(self.hwnd, 1, max(30, self.app.interval) * 1000, None)
+        # 窗口刚建好时快照可能还是空的（首轮读取还在跑），
+        # 这里再触发一次刷新，等读取完成后就能把图标补上
+        self.app.refresh()
+        # Windows 11 默认把新托盘图标收进 ^ 隐藏区，改为任务栏常驻。
+        # 注册表项是 Explorer 在图标加入后才写的，所以要重试几次。
+        threading.Thread(target=self._promote, daemon=True).start()
 
         msg = wt.MSG()
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
@@ -4681,6 +4723,21 @@ class Tray:
         # 通知主线程结束 Tk 主循环，绝不留下“窗口没了进程还活着”的僵尸
         self.app._stop = True
 
+    def _promote(self):
+        """把托盘图标提升到任务栏常驻区（Windows 11 默认藏在 ^ 溢出区）。
+
+        Explorer 是在图标加入之后才写 NotifyIconSettings 注册表项，
+        所以这里隔几秒重试几次。写入 IsPromoted=1 后 Explorer 自己会
+        重新读取该设置，不需要我们删掉图标重建（避免和消息线程抢锁）。
+        """
+        for _ in range(15):
+            time.sleep(2.0)
+            try:
+                if _promote_tray_icon():
+                    return
+            except Exception:
+                pass
+
     def _add_icons(self):
         self.icons.clear()
         self.nids.clear()
@@ -4688,13 +4745,17 @@ class Tray:
         self.sync_icons()
 
     def sync_icons(self):
-        """按实际插入的接收器减托盘图标；七没有时清空托盘?"""
+        """按实际插入的接收器增减托盘图标；没有时清空托盘。
+
+        注意：设备“插着但这一轮没读到”（休眠、瞬时占用）时**不能**删图标，
+        否则用户会看到托盘图标莫名消失。这里以 present（接口还在不在）
+        为准决定图标的有无，ok 只决定图标画什么。
+        """
         snap = self.app.snapshot()
         known = [k for k in ("mouse", "headset")
                  if snap.get(k) and snap[k].present]
         extras = [k for k, r in snap.items()
-                  if k not in ("mouse", "headset") and r and r.present
-                  and r.ok and r.level is not None]
+                  if k not in ("mouse", "headset") and r and r.present]
         present = known + extras
         desired = {i + 1: k for i, k in enumerate(present[:4])}
         for uid in list(self.nids):
@@ -4754,7 +4815,8 @@ class Tray:
         if self._big_icon:
             nid.hIcon = self._big_icon
         nid.uFlags = NIF_INFO | NIF_ICON
-        nid.uVersion = 10000          # 10 ?        nid.szInfo = text[:255]
+        nid.szInfo = text[:255]
+        nid.uVersion = 10000          # 10 秒后自动消失
         nid.szInfoTitle = title[:63]
         nid.dwInfoFlags = NIIF_USER | NIIF_LARGE_ICON
         nid.hBalloonIcon = self._big_icon
@@ -4868,7 +4930,13 @@ class TrayApp:
                 res[key] = read_saved_device(dev, ifaces)
             res = apply_last_known(res)
         except Exception:
-            res = {}
+            # 枚举或读取偶发失败时保留上一轮结果：宁可显示旧电量，
+            # 也不要让托盘图标整块消失
+            with self._lock:
+                res = dict(self._readings)
+            if not res:
+                self._refreshing = False
+                return
         with self._lock:
             self._readings = res
         self._check_full(res)
@@ -5054,6 +5122,66 @@ class TrayApp:
 
 APP_ID = "2.4GDevice.BatteryPanel"
 APP_DISPLAY_NAME = "2.4G"
+
+
+def _promote_tray_icon() -> bool:
+    """把托盘图标从 Windows 11 的“隐藏图标”区提升到任务栏常驻区。
+
+    Windows 11 会把新加入的托盘图标默认收进右下角 ^ 溢出区，用户
+    往往以为“没有图标”。系统在 HKCU\\Control Panel\\NotifyIconSettings
+    下记录每个图标，其中 IsPromoted=1 表示任务栏常驻显示。
+
+    匹配方式：Explorer 用的是 AppUserModelID 而非可执行文件路径
+    （注册表里的 ExecutablePath 可能还是上一次运行的旧路径），
+    所以优先按提示文字匹配，找不到再退回按可执行文件路径匹配。
+
+    找不到或没有权限时静默跳过——这只是锦上添花，不影响功能。
+    """
+    try:
+        import winreg
+    except Exception:
+        return False
+    base = r"Control Panel\NotifyIconSettings"
+    exe = os.path.abspath(sys.executable).lower()
+    by_exe = None
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, base, 0,
+                            winreg.KEY_READ | winreg.KEY_SET_VALUE) as root:
+            count = winreg.QueryInfoKey(root)[0]
+            for i in range(count):
+                try:
+                    name = winreg.EnumKey(root, i)
+                    # 子键必须显式带上写权限：不指定 access 时
+                    # winreg 默认只给 KEY_READ，SetValueEx 会报“拒绝访问”
+                    with winreg.OpenKey(root, name, 0,
+                                        winreg.KEY_READ
+                                        | winreg.KEY_SET_VALUE) as sub:
+                        try:
+                            tip = winreg.QueryValueEx(sub, "InitialTooltip")[0]
+                        except FileNotFoundError:
+                            tip = ""
+                        if str(tip).startswith(APP_DISPLAY_NAME):
+                            winreg.SetValueEx(sub, "IsPromoted", 0,
+                                              winreg.REG_DWORD, 1)
+                            return True
+                        try:
+                            path = winreg.QueryValueEx(sub, "ExecutablePath")[0]
+                        except FileNotFoundError:
+                            continue
+                        if (by_exe is None
+                                and os.path.abspath(path).lower() == exe):
+                            by_exe = name
+                except OSError:
+                    continue
+            if by_exe:
+                with winreg.OpenKey(root, by_exe, 0,
+                                    winreg.KEY_SET_VALUE) as sub:
+                    winreg.SetValueEx(sub, "IsPromoted", 0,
+                                      winreg.REG_DWORD, 1)
+                    return True
+    except OSError:
+        return False
+    return False
 
 
 def register_app_identity():
