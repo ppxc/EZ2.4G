@@ -2539,7 +2539,24 @@ def set_custom_name(key: str, name: str) -> None:
 # CLI
 # ===========================================================================
 def print_once():
-    res = apply_last_known(read_all())
+    """读一次并打印。先打已保存的设备；没有保存设备时才退回内置设备。"""
+    ifaces = enumerate_hid()
+    saved = load_saved_devices()
+    if saved:
+        res = {}
+        for dev in saved:
+            key = device_key(dev["vid"], dev["pid"])
+            res[key] = read_saved_device(dev, ifaces)
+        res = apply_last_known(res)
+        for dev in saved:
+            r = res[device_key(dev["vid"], dev["pid"])]
+            if r.ok:
+                suffix = f"；{r.detail}" if r.stale else f"（{r.source}）"
+                print(f"{r.name}：{r.level}%{suffix}")
+            else:
+                print(f"{r.name}：{r.text}（{r.detail}）")
+        return
+    res = apply_last_known(read_all(ifaces))
     for key in ("mouse", "headset"):
         r = res[key]
         if r.ok:
