@@ -708,13 +708,15 @@ def royuan_read(iface: HidIface, timeout: float = 0.9) -> Optional[Reading]:
             best = ("鼠标", ms)
         elif kb_online and kb <= 100:
             best = ("键盘", kb)
-        elif ms <= 100:
+        elif 0 < ms <= 100:
+            # 在线标志可能因机型/固件而异；有非零值就认
             best = ("鼠标", ms)
-        elif kb <= 100:
+        elif 0 < kb <= 100:
             best = ("键盘", kb)
         if best is None:
+            # 两个字段都是 0 且标记离线：设备在休眠，交给上层按“休眠”沿用上次电量
             return Reading(ok=False, source="ROYUAN 协议",
-                           detail=f"状态里没有合法电量：{payload[:8].hex(' ')}")
+                           detail=f"状态里没有合法电量（设备休眠或未连线）：{payload[:8].hex(' ')}")
         label, level = best
         return Reading(ok=True, level=_clamp(level),
                        source="ROYUAN 协议（0xF7）",
