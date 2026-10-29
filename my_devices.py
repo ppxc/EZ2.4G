@@ -6,6 +6,7 @@
 纯标准库 + ctypes + tkinter，零第三方依赖?
 用法?    python my_devices.py              # 托盘 + 简洁面板?    python my_devices.py --once       # 读一次并打印
     python my_devices.py --list       # 列出的 HID 接口
+    python my_devices.py --probe      # 打原始回包（适配新设备/排查字段）
     python my_devices.py --panel      # 打开面板（不常驻托盘?    python my_devices.py --install    # 创建开机自启?+ 桌面入口
 """
 from __future__ import annotations
@@ -660,6 +661,72 @@ def sc525_read(iface: HidIface, timeout: float = 1.0) -> Optional[Reading]:
         dev.close()
 
 
+def royuan_read(iface: HidIface, timeout: float = 0.9) -> Optional[Reading]:
+    """ROYUAN（容圆）系 2.4G 接收器：GET 0xF7 读键盘/鼠标电量。
+
+    这类接收器（VID 0x374A、0x3151 等）在 usage page 0xFFFF、
+    usage 1 或 2 的厂商集合上提供 64 字节 feature 报告（report id 0）。
+    接收器自己的 opcode 走 Bit7，且回包**不**回显 opcode。0xF7 = status：
+
+        payload[0]  有转发回复待取时为 1
+        payload[1]  键盘电量（%）
+        payload[2]  鼠标电量（%）
+        payload[3]  键盘在线时为 0
+        payload[4]  鼠标在线时为 0
+        payload[5]  接收器可接受转发命令时为 1
+        payload[6]  1=键盘 2=鼠标 3=都在
+
+    字段含义取自 sharkfin 项目的 docs/PROTOCOL.md（“2.4 GHz receiver”
+    一节）；其中鼠标电量一列在该项目里标注为“仅厂商主机代码，未实测”，
+    所以这里对 0..100 之外的值一律拒收，而不是照抄显示。
+    """
+    if iface.usage_page != 0xFFFF or iface.usage not in (0x0001, 0x0002):
+        return None
+    if iface.feature_len < 64:
+        return None
+    dev = None
+    try:
+        dev = HidDevice(iface.path, write=False)
+    except HidError as e:
+        return Reading(ok=False, source="ROYUAN 协议", detail=str(e))
+    try:
+        req = bytes([0x00, 0xF7]) + bytes(iface.feature_len - 2)
+        if not dev.set_feature(req):
+            return Reading(ok=False, source="ROYUAN 协议",
+                           detail="写入 0xF7 查询失败")
+        time.sleep(0.12)
+        rep = dev.get_feature(iface.feature_len)
+        if not rep or len(rep) < 8:
+            return Reading(ok=False, source="ROYUAN 协议",
+                           detail="没有收到 0xF7 状态回复")
+        payload = rep[1:] if iface.feature_len > 64 else rep
+        kb, ms = payload[1], payload[2]
+        kb_online = payload[3] == 0
+        ms_online = payload[4] == 0
+        best = None
+        if ms_online and ms <= 100:
+            best = ("鼠标", ms)
+        elif kb_online and kb <= 100:
+            best = ("键盘", kb)
+        elif ms <= 100:
+            best = ("鼠标", ms)
+        elif kb <= 100:
+            best = ("键盘", kb)
+        if best is None:
+            return Reading(ok=False, source="ROYUAN 协议",
+                           detail=f"状态里没有合法电量：{payload[:8].hex(' ')}")
+        label, level = best
+        return Reading(ok=True, level=_clamp(level),
+                       source="ROYUAN 协议（0xF7）",
+                       detail=f"{label}电量 {level}%（回复 {payload[:8].hex(' ')}）",
+                       raw=rep)
+    except HidError as e:
+        return Reading(ok=False, source="ROYUAN 协议", detail=str(e))
+    finally:
+        if dev is not None:
+            dev.close()
+
+
 def read_standard_battery(iface: HidIface) -> Optional[Reading]:
     if not iface.feature_len:
         return None
@@ -1104,8 +1171,8 @@ def has_device_protocol(vid: int, pid: int) -> bool:
     return f"{vid:04X}:{pid:04X}" in user_protocols()
 
 
-def save_sc525_protocol(vid: int, pid: int) -> None:
-    """记住这个设备走 SC525 厂商协议。
+def save_vendor_protocol(vid: int, pid: int, kind: str) -> None:
+    """记住某个设备走的厂商协议（sc525 / royuan / ...）。
 
     存了协议之后，设备读不到时按“休眠”处理：沿用上次的电量，
     托盘图标不会因为一次读取失败就整块消失。
@@ -1115,10 +1182,15 @@ def save_sc525_protocol(vid: int, pid: int) -> None:
     protos = cfg.get("protocols")
     if not isinstance(protos, dict):
         protos = {}
-    if protos.get(key, {}).get("kind") != "sc525":
-        protos[key] = {"kind": "sc525"}
+    if protos.get(key, {}).get("kind") != kind:
+        protos[key] = {"kind": kind}
         cfg["protocols"] = protos
         save_config(cfg)
+
+
+def save_sc525_protocol(vid: int, pid: int) -> None:
+    """兼容旧调用：等价于 save_vendor_protocol(vid, pid, "sc525")。"""
+    save_vendor_protocol(vid, pid, "sc525")
 
 
 def save_standard_protocol(vid: int, pid: int) -> None:
@@ -1173,7 +1245,8 @@ def read_saved_device(dev: dict, ifaces=None) -> Reading:
     proto = user_protocols().get(key)
     kind = (proto or {}).get("kind", "captured")
     r = None
-    if kind != "sc525":
+    sc525_fail = None
+    if kind not in ("sc525", "royuan"):
         # 标准 HID 直接读
         for d in cand:
             try:
@@ -1194,24 +1267,35 @@ def read_saved_device(dev: dict, ifaces=None) -> Reading:
                     pass
     if not r or not r.ok:
         # SC525 接收器（VID 0x32C2 等）：厂商私有协议，需要单独一条路
-        sc525_fail = None
-        for d in cand:
-            try:
-                rr = sc525_read(d)
-            except Exception:
-                rr = None
-            if rr is not None and rr.ok and rr.level is not None:
-                r = rr
-                break
-            if rr is not None and sc525_fail is None:
-                sc525_fail = rr
-    else:
-        sc525_fail = None
+        if kind != "royuan":
+            for d in cand:
+                try:
+                    rr = sc525_read(d)
+                except Exception:
+                    rr = None
+                if rr is not None and rr.ok and rr.level is not None:
+                    r = rr
+                    break
+                if rr is not None and sc525_fail is None:
+                    sc525_fail = rr
+    if not r or not r.ok:
+        # ROYUAN（容圆）系接收器（VID 0x374A 等）：64 字节 feature，0xF7 状态
+        if kind != "sc525":
+            for d in cand:
+                try:
+                    rr = royuan_read(d)
+                except Exception:
+                    rr = None
+                if rr is not None and rr.ok and rr.level is not None:
+                    r = rr
+                    break
     if r is not None and r.ok and proto is None:
         # 记住这个设备走的是哪条协议：以后读不到时按“休眠”处理，
         # 托盘图标保留上次电量，而不是整块消失
         if r.source.startswith("SC525"):
-            save_sc525_protocol(vid, pid)
+            save_vendor_protocol(vid, pid, "sc525")
+        elif r.source.startswith("ROYUAN"):
+            save_vendor_protocol(vid, pid, "royuan")
         else:
             save_standard_protocol(vid, pid)
     supported = key in user_protocols()
@@ -1231,6 +1315,8 @@ def read_saved_device(dev: dict, ifaces=None) -> Reading:
             r.source = "标准 HID 电量"
         elif kind == "sc525":
             r.source = "SC525 协议（0xFF0F，命令 0x20）"
+        elif kind == "royuan":
+            r.source = "ROYUAN 协议（0xF7）"
         else:
             r.source = "抓包协议"
         if not r.detail:
@@ -1260,6 +1346,15 @@ def _unknown_reading(name: str, ifaces: list[HidIface],
     for d in ifaces:
         try:
             r = sc525_read(d)
+        except Exception:
+            r = None
+        if r is not None and r.ok and r.level is not None:
+            r.name = name
+            return r
+    # ROYUAN（容圆）系接收器（VID 0x374A 等）
+    for d in ifaces:
+        try:
+            r = royuan_read(d)
         except Exception:
             r = None
         if r is not None and r.ok and r.level is not None:
@@ -2677,6 +2772,67 @@ def _helper_run(args: list):
         sys.argv = old
 
 
+def probe_devices():
+    """把每个设备的原始回报打出来，用于判断协议字段和适配新设备。
+
+    - SC525 形状（厂商页 0xFF0F，32 字节进 / 16 字节出）：问 0x20 电量、
+      0x21 设备信息，并把 0x20 里几个可疑字段都单独列出来
+    - ROYUAN 形状（厂商页 0xFFFF，>=64 字节 feature）：问 0xF7 状态
+    - 其它厂商集合：把 length 和尝试结果列出来
+    """
+    ifaces = enumerate_hid()
+    if not ifaces:
+        print("没有枚举到 HID 接口")
+        return
+    for d in ifaces:
+        print(f"\n{d.vid:04X}:{d.pid:04X}  UP={d.usage_page:04X} U={d.usage:04X} "
+              f"in={d.input_len} out={d.output_len} feat={d.feature_len} "
+              f"{d.product!r}")
+        if d.usage_page == 0xFF0F and d.input_len >= 32 and d.output_len >= 16:
+            _probe_sc525(d)
+        elif d.usage_page == 0xFFFF and d.feature_len >= 64:
+            _probe_royuan(d)
+
+
+def _probe_sc525(d):
+    dev = None
+    try:
+        dev = HidDevice(d.path, write=True)
+    except HidError as e:
+        print(f"   打不开：{e}")
+        return
+    try:
+        for cmd in (0x20, 0x21):
+            dev.drain()
+            dev.write_output(bytes([0x0E, cmd]) + bytes(d.output_len - 2))
+            rep = None
+            deadline = time.monotonic() + 1.2
+            while time.monotonic() < deadline:
+                rr = dev.read_input(d.input_len, 250)
+                if rr and len(rr) >= 4 and rr[0] == 0x0E and rr[1] == cmd:
+                    rep = rr
+                    break
+            if not rep:
+                print(f"   命令 0x{cmd:02X}：无回复")
+                continue
+            print(f"   命令 0x{cmd:02X}：{rep[:16].hex(' ')}")
+            if cmd == 0x20 and len(rep) >= 10:
+                print(f"      → 状态字节[2]=0x{rep[2]:02X}  候选电量字节[8]={rep[8]}"
+                      f"  字节[9]=0x{rep[9]:02X}（低7位={rep[9] & 0x7F}）")
+            if cmd == 0x21:
+                text = bytes(b for b in rep[2:] if 32 <= b < 127)
+                if text:
+                    print(f"      → 可打印串：{text.decode('ascii', 'replace')}")
+    finally:
+        if dev is not None:
+            dev.close()
+
+
+def _probe_royuan(d):
+    r = royuan_read(d)
+    print(f"   0xF7 → ok={r.ok} level={r.level} detail={r.detail}")
+
+
 def main(argv):
     if argv and argv[0] == "--capture-helper":
         _helper_run(argv[1:])
@@ -2689,6 +2845,9 @@ def main(argv):
         return 0
     if "--list" in argv:
         list_devices()
+        return 0
+    if "--probe" in argv:
+        probe_devices()
         return 0
     if "--install" in argv:
         install_all()
