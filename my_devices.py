@@ -7,6 +7,7 @@
 用法?    python my_devices.py              # 托盘 + 简洁面板?    python my_devices.py --once       # 读一次并打印
     python my_devices.py --list       # 列出的 HID 接口
     python my_devices.py --probe      # 打原始回包（适配新设备/排查字段）
+    python my_devices.py --bt         # 列出蓝牙设备的电量（含 Windows 缓存）
     python my_devices.py --panel      # 打开面板（不常驻托盘?    python my_devices.py --install    # 创建开机自启?+ 桌面入口
 """
 from __future__ import annotations
@@ -1228,11 +1229,218 @@ def save_saved_devices(devs: list) -> None:
     save_config(cfg)
 
 
+# =========================================================================
+# 蓝牙电池服务（0x180F / 0x2A19）
+#
+# 有些 2.4G 键盘的 dongle 把厂商通道放在键盘顶层集合上，Windows 直接禁读
+# （VGN V98 Pro 就是这样）。好在同一把键盘通常还配对过蓝牙，Windows 会把
+# BLE 电量缓存下来 —— 即使当前走的是 2.4G、蓝牙链路是断开的，缓存值依然可读。
+#
+# 读 WinRT 在 Python 里没有干净路径（IBuffer 取字节尤其麻烦），所以交给
+# PowerShell 做，本程序仍然只依赖标准库。
+# =========================================================================
+BT_PS = r"""
+param([string]$Match = "")
+# Enumerate paired BLE devices and read standard Battery Service 0x180F / 0x2A19.
+# Output: BT|<device name>|<level>
+Add-Type -AssemblyName System.Runtime.WindowsRuntime | Out-Null
+
+$asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+    $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and
+    $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
+})[0]
+
+function Await($op, $type, $ms = 12000) {
+    $t = $asTaskGeneric.MakeGenericMethod($type).Invoke($null, @($op))
+    if (-not $t.Wait($ms)) { return $null }
+    if ($t.IsFaulted) { throw $t.Exception.GetBaseException().Message }
+    return $t.Result
+}
+
+[Windows.Devices.Enumeration.DeviceInformation, Windows.Devices.Enumeration, ContentType = WindowsRuntime] | Out-Null
+[Windows.Devices.Bluetooth.BluetoothLEDevice, Windows.Devices.Bluetooth, ContentType = WindowsRuntime] | Out-Null
+[Windows.Devices.Bluetooth.BluetoothCacheMode, Windows.Devices.Bluetooth, ContentType = WindowsRuntime] | Out-Null
+[Windows.Devices.Bluetooth.GenericAttributeProfile.GattDeviceServicesResult, Windows.Devices.Bluetooth, ContentType = WindowsRuntime] | Out-Null
+[Windows.Devices.Bluetooth.GenericAttributeProfile.GattCharacteristicsResult, Windows.Devices.Bluetooth, ContentType = WindowsRuntime] | Out-Null
+[Windows.Devices.Bluetooth.GenericAttributeProfile.GattReadResult, Windows.Devices.Bluetooth, ContentType = WindowsRuntime] | Out-Null
+[Windows.Storage.Streams.IBuffer, Windows.Storage.Streams, ContentType = WindowsRuntime] | Out-Null
+[Windows.Storage.Streams.DataReader, Windows.Storage.Streams, ContentType = WindowsRuntime] | Out-Null
+
+$BATT_SVC = [Guid]'0000180f-0000-1000-8000-00805f9b34fb'
+$BATT_CHR = [Guid]'00002a19-0000-1000-8000-00805f9b34fb'
+
+$sel = [Windows.Devices.Bluetooth.BluetoothLEDevice]::GetDeviceSelectorFromPairingState($true)
+$devs = Await ([Windows.Devices.Enumeration.DeviceInformation]::FindAllAsync($sel)) ([Windows.Devices.Enumeration.DeviceInformationCollection])
+
+if (-not $devs -or $devs.Count -eq 0) { Write-Output "BTERR none"; exit 0 }
+
+foreach ($d in $devs) {
+    if ($Match -and $d.Name -notlike ("*" + $Match + "*")) { continue }
+    $tail = ($d.Id -split '-')[-1]
+    $hex = ($tail -replace ':', '')
+    if ($hex.Length -ne 12) { continue }
+    $addr = [Convert]::ToUInt64($hex, 16)
+
+    $bt = $null
+    try { $bt = Await ([Windows.Devices.Bluetooth.BluetoothLEDevice]::FromBluetoothAddressAsync($addr)) ([Windows.Devices.Bluetooth.BluetoothLEDevice]) }
+    catch { }
+    if (-not $bt) { continue }
+
+    $level = $null
+    foreach ($mode in @([Windows.Devices.Bluetooth.BluetoothCacheMode]::Uncached,
+                        [Windows.Devices.Bluetooth.BluetoothCacheMode]::Cached)) {
+        if ($null -ne $level) { break }
+        try {
+            $svcRes = Await ($bt.GetGattServicesForUuidAsync($BATT_SVC, $mode)) ([Windows.Devices.Bluetooth.GenericAttributeProfile.GattDeviceServicesResult])
+            if (-not $svcRes -or $svcRes.Services.Count -eq 0) { continue }
+            foreach ($s in $svcRes.Services) {
+                $cRes = Await ($s.GetCharacteristicsForUuidAsync($BATT_CHR, $mode)) ([Windows.Devices.Bluetooth.GenericAttributeProfile.GattCharacteristicsResult])
+                if (-not $cRes -or $cRes.Characteristics.Count -eq 0) { continue }
+                foreach ($c in $cRes.Characteristics) {
+                    $vRes = Await ($c.ReadValueAsync($mode)) ([Windows.Devices.Bluetooth.GenericAttributeProfile.GattReadResult])
+                    if (-not $vRes -or $vRes.Status -ne 'Success') { continue }
+                    $val = $null
+                    try {
+                        $ibuf = [Windows.Storage.Streams.IBuffer]$vRes.Value
+                        $val = [Windows.Storage.Streams.DataReader]::FromBuffer($ibuf).ReadByte()
+                    }
+                    catch {
+                        $ext = [System.Runtime.InteropServices.WindowsRuntime.WindowsRuntimeBufferExtensions]
+                        $mi = ($ext.GetMethods() | Where-Object {
+                            $_.Name -eq 'ToArray' -and $_.GetParameters().Count -eq 1
+                        })[0]
+                        $val = [int]($mi.Invoke($null, @($vRes.Value))[0])
+                    }
+                    if ($null -ne $val) { $level = $val; break }
+                }
+            }
+        }
+        catch { }
+    }
+    if ($null -ne $level) { Write-Output ("BT|" + $d.Name + "|" + $level) }
+}
+"""
+
+_BT_CACHE = {"t": 0.0, "data": {}}
+BT_CACHE_TTL = 90.0
+
+
+def _bt_scan(match: str = "", force: bool = False, timeout: int = 0) -> dict:
+    """跑一次 PowerShell 拿已配对蓝牙设备的电量，返回 {名称: 百分比}。
+
+    Windows 缓存的 GATT 值在蓝牙链路断开时也读得到，所以键盘用 2.4G 时
+    依然能拿到上次的电量。带 match 时只连目标设备（快得多）。
+    """
+    if not timeout:
+        timeout = 40 if match else 180
+    now = time.time()
+    if not force and _BT_CACHE["data"] and now - _BT_CACHE["t"] < BT_CACHE_TTL:
+        cached = _BT_CACHE["data"]
+        if not match:
+            return cached
+        return {k: v for k, v in cached.items() if match.lower() in k.lower()}
+    root = os.environ.get("SystemRoot", r"C:\Windows")
+    exe = os.path.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+    if not os.path.exists(exe):
+        exe = "powershell.exe"
+    script = os.path.join(tempfile.gettempdir(), "ez24g_bt_battery.ps1")
+    try:
+        with open(script, "w", encoding="ascii", errors="replace") as f:
+            f.write(BT_PS)
+    except OSError:
+        return _BT_CACHE["data"]
+    args = [exe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script]
+    if match:
+        args += ["-Match", match]
+    data = {}
+    try:
+        cp = subprocess.run(
+            args, capture_output=True, timeout=timeout,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        text = (cp.stdout or b"").decode("utf-8", "replace")
+    except Exception:
+        return _BT_CACHE["data"]
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("BT|"):
+            continue
+        parts = line.split("|")
+        if len(parts) >= 3:
+            try:
+                data[parts[1]] = int(parts[2])
+            except ValueError:
+                pass
+    if data:
+        _BT_CACHE["data"] = data
+        _BT_CACHE["t"] = time.time()
+    return data
+
+
+def bt_read(match: str) -> Optional[Reading]:
+    """按设备名（子串）从蓝牙电池服务读电量。"""
+    data = _bt_scan(match)
+    if not data:
+        return Reading(ok=False, source="蓝牙电池服务（0x180F）",
+                       detail=f"没有匹配 {match!r} 的已配对蓝牙设备")
+    for name, level in data.items():
+        if not match or match.lower() in name.lower():
+            return Reading(ok=True, level=_clamp(level),
+                           source="蓝牙电池服务（0x180F）",
+                           detail=f"{name}（Windows 缓存）")
+    return Reading(ok=False, source="蓝牙电池服务（0x180F）",
+                   detail=f"没有匹配 {match!r} 的已配对蓝牙设备")
+
+
+def save_bt_protocol(vid: int, pid: int, match: str) -> None:
+    """记住这个设备走蓝牙读电量（这一代 dongle 的 2.4G 厂商通道被系统禁读）。"""
+    key = f"{vid:04X}:{pid:04X}"
+    cfg = load_config()
+    protos = cfg.get("protocols")
+    if not isinstance(protos, dict):
+        protos = {}
+    want = {"kind": "bt", "match": match}
+    if protos.get(key) != want:
+        protos[key] = want
+        cfg["protocols"] = protos
+        save_config(cfg)
+
+
+def _read_bt_device(dev: dict, proto: dict, ifaces) -> Reading:
+    vid = int(dev["vid"])
+    pid = int(dev["pid"])
+    name = dev.get("name") or f"{vid:04X}:{pid:04X}"
+    keys = ("match", "bt_name", "source_name")
+    match = next((proto.get(k) for k in keys if proto.get(k)), None) or name
+    r = bt_read(match)
+    cand = [d for d in ifaces if d.vid == vid and d.pid == pid]
+    r.name = name
+    r.vid, r.pid = vid, pid
+    if r.ok:
+        r.present = True
+        r.status = "unknown"
+    elif cand:
+        r.present = True
+        r.status = "asleep"
+    else:
+        r.present = False
+        r.status = "unplugged"
+    r.hid_known = bool(cand)
+    if cand:
+        meta = next((d for d in cand if d.usage_page >= 0xFF00), cand[0])
+        r.usage_page = meta.usage_page
+    return r
+
+
 def read_saved_device(dev: dict, ifaces=None) -> Reading:
     vid = int(dev["vid"])
     pid = int(dev["pid"])
     name = dev.get("name") or ""
     ifaces = ifaces if ifaces is not None else enumerate_hid()
+    key = f"{vid:04X}:{pid:04X}"
+    _bt = user_protocols().get(key) or {}
+    if _bt.get("kind") == "bt":
+        # 蓝牙路径不需要 HID 接口存在，先分流
+        return _read_bt_device(dev, _bt, ifaces)
     cand = [d for d in ifaces if d.vid == vid and d.pid == pid]
     if not cand:
         return Reading(ok=False, present=False,
@@ -2852,6 +3060,16 @@ def _probe_royuan(d):
     print(f"   0xF7 → ok={r.ok} level={r.level} detail={r.detail}")
 
 
+def print_bt(verbose: bool = False):
+    """列出所有已配对蓝牙设备的电量（含 Windows 缓存读数）。"""
+    data = _bt_scan(force=True)
+    if not data:
+        print("没有可从蓝牙电池服务读到电量的已配对设备")
+        return
+    for name, level in sorted(data.items(), key=lambda kv: -kv[1]):
+        print(f"{name}：{level}%")
+
+
 def main(argv):
     if argv and argv[0] == "--capture-helper":
         _helper_run(argv[1:])
@@ -2867,6 +3085,12 @@ def main(argv):
         return 0
     if "--probe" in argv:
         probe_devices()
+        print("\n--- 蓝牙电池服务 ---")
+        for nm, lv in sorted(_bt_scan(force=True).items()):
+            print(f"  {nm}: {lv}%")
+        return 0
+    if "--bt" in argv:
+        print_bt()
         return 0
     if "--install" in argv:
         install_all()
