@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-外设电量 —?Windows 10/11 无线外设电量托盘工具
+外设电量 — Windows 10/11 无线外设电量托盘工具
 
-纯标准库 + ctypes + tkinter，零第三方依赖?
-用法?    python my_devices.py              # 托盘 + 简洁面板?    python my_devices.py --once       # 读一次并打印
-    python my_devices.py --list       # 列出的 HID 接口
-    python my_devices.py --probe      # 打原始回包（适配新设备/排查字段）
-    python my_devices.py --bt         # 列出蓝牙设备的电量（含 Windows 缓存）
-    python my_devices.py --panel      # 打开面板（不常驻托盘?    python my_devices.py --install    # 创建开机自启?+ 桌面入口
+纯标准库 + ctypes + tkinter，零第三方依赖。
+
+用法（打包版）：
+    2.4G.exe                # 托盘 + 简洁面板
+    2.4G.exe --once         # 读一次并打印
+    2.4G.exe --list         # 列出 HID 接口
+    2.4G.exe --probe        # 打原始回包（适配新设备 / 排查字段）
+    2.4G.exe --bt           # 列出蓝牙设备的电量（含 Windows 缓存）
+    2.4G.exe --panel        # 打开面板（不常驻托盘）
+    2.4G.exe --install      # 创建开机自启 + 桌面入口
+
+源码运行时把 2.4G.exe 换成 python my_devices.py 即可。
 """
 from __future__ import annotations
 
@@ -1391,6 +1397,49 @@ def bt_read(match: str) -> Optional[Reading]:
                    detail=f"没有匹配 {match!r} 的已配对蓝牙设备")
 
 
+def _name_tokens(s: str) -> list:
+    """把产品名拆成 ASCII 词块，用来和蓝牙设备名模糊匹配。"""
+    out, cur = [], []
+    for ch in s or "":
+        if ch.isascii() and ch.isalnum():
+            cur.append(ch)
+        else:
+            if len(cur) >= 2:
+                out.append("".join(cur))
+            cur = []
+    if len(cur) >= 2:
+        out.append("".join(cur))
+    return out
+
+
+def _bt_guess(product: str):
+    """HID 厂商通道读不到时，按产品名去找同一把三模键盘的蓝牙条目。
+
+    VGN V98 PRO 2.4G Dongle —— 它的 2.4G 厂商通道被系统禁读，但同一把
+    键盘配对过蓝牙的话，Windows 缓存的电量能读到。返回 (Reading, 匹配到的名字)。
+    """
+    tokens = _name_tokens(product)
+    if len(tokens) < 2:
+        return None, None
+    probe = tokens[0]
+    data = _bt_scan(match=probe)
+    if not data:
+        return None, None
+    best = None
+    for nm, lvl in data.items():
+        low = nm.lower()
+        hit = sum(1 for t in tokens[:3] if t.lower() in low)
+        if hit >= 2 and (best is None or hit > best[0]):
+            best = (hit, nm, lvl)
+    if not best:
+        return None, None
+    _, nm, lvl = best
+    r = Reading(ok=True, level=_clamp(lvl),
+                source="蓝牙电池服务（0x180F）",
+                detail=f"{nm}（按产品名匹配）")
+    return r, nm
+
+
 def save_bt_protocol(vid: int, pid: int, match: str) -> None:
     """记住这个设备走蓝牙读电量（这一代 dongle 的 2.4G 厂商通道被系统禁读）。"""
     key = f"{vid:04X}:{pid:04X}"
@@ -1443,6 +1492,19 @@ def read_saved_device(dev: dict, ifaces=None) -> Reading:
         return _read_bt_device(dev, _bt, ifaces)
     cand = [d for d in ifaces if d.vid == vid and d.pid == pid]
     if not cand:
+        # 设备没插：如果没登记过协议，先按名字试试蓝牙（三模设备拔了
+        # dongle 也能从 Windows 缓存的蓝牙电池服务读到电量）
+        if key not in user_protocols():
+            guess, matched = _bt_guess(name or f"{vid:04X}:{pid:04X}")
+            if guess is not None:
+                if matched:
+                    save_bt_protocol(vid, pid, matched.split(" BT")[0].strip())
+                guess.name = name or matched
+                guess.vid, guess.pid = vid, pid
+                guess.present = True
+                guess.status = "unknown"
+                guess.hid_known = False
+                return guess
         return Reading(ok=False, present=False,
                        name=name or f"{vid:04X}:{pid:04X}",
                        status=("unplugged" if has_device_protocol(vid, pid)
@@ -1509,6 +1571,15 @@ def read_saved_device(dev: dict, ifaces=None) -> Reading:
         else:
             save_standard_protocol(vid, pid)
     supported = key in user_protocols()
+    if r is None and not supported and prod:
+        # 厂商通道可能被系统禁读（VGN/Telink 的 dongle 把配置通道放在键盘
+        # 集合上）。同一把三模键盘若配对过蓝牙，就用 Windows 缓存的电量，
+        # 并把匹配到的名字记下来，下次直接走蓝牙。
+        guess, matched = _bt_guess(prod)
+        if guess is not None:
+            r = guess
+            if matched:
+                save_bt_protocol(vid, pid, matched.split(" BT")[0].strip())
     if r is None:
         r = Reading(
             ok=False, present=True, name=name,
@@ -3070,10 +3141,44 @@ def print_bt(verbose: bool = False):
         print(f"{name}：{level}%")
 
 
+def _cli_stdio():
+    """打包成 windowed exe 后，CLI 模式要自己处理控制台与编码。
+
+    - 没有 stdout（真·双击启动那种）：挂到父控制台，没有就开一个
+    - 输出到控制台：用系统 ANSI 代码页（中文 cmd 里才不乱码）
+    - 输出到管道/文件：用 UTF-8
+    """
+    if not getattr(sys, "frozen", False):
+        return
+    if sys.stdout is not None and sys.stderr is not None:
+        for s in (sys.stdout, sys.stderr):
+            try:
+                s.reconfigure(encoding=("mbcs" if s.isatty() else "utf-8"),
+                              errors="replace")
+            except Exception:
+                pass
+        return
+    try:
+        if not kernel32.AttachConsole(-1):
+            kernel32.AllocConsole()
+    except Exception:
+        return
+    try:
+        sys.stdout = open("CONOUT$", "w", encoding="mbcs", errors="replace",
+                          buffering=1)
+        sys.stderr = open("CONOUT$", "w", encoding="mbcs", errors="replace",
+                          buffering=1)
+    except Exception:
+        pass
+
+
 def main(argv):
     if argv and argv[0] == "--capture-helper":
         _helper_run(argv[1:])
         return 0
+    if any(a in argv for a in ("--once", "--list", "--probe", "--bt",
+                               "--install", "--help", "-h")):
+        _cli_stdio()
     if "--help" in argv or "-h" in argv:
         print(__doc__)
         return 0
@@ -5129,13 +5234,15 @@ class Tray:
         """把托盘图标提升到任务栏常驻区（Windows 11 默认藏在 ^ 溢出区）。
 
         Explorer 是在图标加入之后才写 NotifyIconSettings 注册表项，
-        所以这里隔几秒重试几次。写入 IsPromoted=1 后 Explorer 自己会
-        重新读取该设置，不需要我们删掉图标重建（避免和消息线程抢锁）。
+        所以这里隔几秒重试几次，直到**所有**图标的 IsPromoted 都写成 1。
+        写入 IsPromoted=1 后 Explorer 自己会重新读取该设置，不需要我们
+        删掉图标重建（避免和消息线程抢锁）。
         """
-        for _ in range(15):
-            time.sleep(2.0)
+        for _ in range(20):
+            time.sleep(1.5)
             try:
-                if _promote_tray_icon():
+                want = max(1, len(self.nids))
+                if _promote_tray_icon() >= want:
                     return
             except Exception:
                 pass
@@ -5526,12 +5633,15 @@ APP_ID = "2.4GDevice.BatteryPanel"
 APP_DISPLAY_NAME = "2.4G"
 
 
-def _promote_tray_icon() -> bool:
-    """把托盘图标从 Windows 11 的“隐藏图标”区提升到任务栏常驻区。
+def _promote_tray_icon() -> int:
+    """把本程序的托盘图标提升到任务栏常驻区，返回成功提升的个数。
 
     Windows 11 会把新加入的托盘图标默认收进右下角 ^ 溢出区，用户
     往往以为“没有图标”。系统在 HKCU\\Control Panel\\NotifyIconSettings
     下记录每个图标，其中 IsPromoted=1 表示任务栏常驻显示。
+
+    注意要**遍历全部**匹配项：一个程序可能有多个图标（每台设备一个），
+    只提升第一个等于其余的永远藏在溢出区。
 
     匹配方式：Explorer 用的是 AppUserModelID 而非可执行文件路径
     （注册表里的 ExecutablePath 可能还是上一次运行的旧路径），
@@ -5542,10 +5652,11 @@ def _promote_tray_icon() -> bool:
     try:
         import winreg
     except Exception:
-        return False
+        return 0
     base = r"Control Panel\NotifyIconSettings"
     exe = os.path.abspath(sys.executable).lower()
     by_exe = None
+    promoted = 0
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, base, 0,
                             winreg.KEY_READ | winreg.KEY_SET_VALUE) as root:
@@ -5565,7 +5676,8 @@ def _promote_tray_icon() -> bool:
                         if str(tip).startswith(APP_DISPLAY_NAME):
                             winreg.SetValueEx(sub, "IsPromoted", 0,
                                               winreg.REG_DWORD, 1)
-                            return True
+                            promoted += 1
+                            continue
                         try:
                             path = winreg.QueryValueEx(sub, "ExecutablePath")[0]
                         except FileNotFoundError:
@@ -5575,15 +5687,15 @@ def _promote_tray_icon() -> bool:
                             by_exe = name
                 except OSError:
                     continue
-            if by_exe:
+            if promoted == 0 and by_exe:
                 with winreg.OpenKey(root, by_exe, 0,
                                     winreg.KEY_SET_VALUE) as sub:
                     winreg.SetValueEx(sub, "IsPromoted", 0,
                                       winreg.REG_DWORD, 1)
-                    return True
+                    promoted = 1
     except OSError:
-        return False
-    return False
+        return promoted
+    return promoted
 
 
 def register_app_identity():
