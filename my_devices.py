@@ -685,8 +685,16 @@ def royuan_read(iface: HidIface, timeout: float = 0.9) -> Optional[Reading]:
         payload[6]  1=键盘 2=鼠标 3=都在
 
     字段含义取自 sharkfin 项目的 docs/PROTOCOL.md（“2.4 GHz receiver”
-    一节）；其中鼠标电量一列在该项目里标注为“仅厂商主机代码，未实测”，
-    所以这里对 0..100 之外的值一律拒收，而不是照抄显示。
+    一节），并已用厂商网页驱动 VK HUB（vkhub.valkyrie.com.cn）的
+    `CommonRyDongle.___dongleCheck24GStatusByF7` 逐字节核对：
+
+        c = s[6]                        // 1=键盘 2=鼠标 3=都在
+        c === 2 && { battery: s[2], isOnline: s[4] === 0,
+                     isCanSend: s[5] === 1, isRFBoot: s[8] === 1 }
+
+    与下面的实现完全一致。注意厂商在设备离线时也是沿用上一次的电量
+    （`battery: this.prevMouseStatus.battery`），所以离线读到的是
+    接收器缓存值，detail 里会标明。
     """
     if iface.usage_page != 0xFFFF or iface.usage not in (0x0001, 0x0002):
         return None
@@ -726,9 +734,12 @@ def royuan_read(iface: HidIface, timeout: float = 0.9) -> Optional[Reading]:
             return Reading(ok=False, source="ROYUAN 协议",
                            detail=f"状态里没有合法电量（设备休眠或未连线）：{payload[:8].hex(' ')}")
         label, level = best
+        online = ms_online if label == "鼠标" else kb_online
+        note = "在线" if online else "设备休眠，接收器缓存值"
         return Reading(ok=True, level=_clamp(level),
                        source="ROYUAN 协议（0xF7）",
-                       detail=f"{label}电量 {level}%（回复 {payload[:8].hex(' ')}）",
+                       detail=f"{label} {level}% · {note}",
+                       stale=not online,
                        raw=rep)
     except HidError as e:
         return Reading(ok=False, source="ROYUAN 协议", detail=str(e))
