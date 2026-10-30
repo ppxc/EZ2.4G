@@ -10,7 +10,7 @@
     2.4G.exe --once         # 读一次并打印
     2.4G.exe --list         # 列出 HID 接口
     2.4G.exe --probe        # 打原始回包（适配新设备 / 排查字段）
-    2.4G.exe --bt           # 列出蓝牙设备的电量（含 Windows 缓存）
+    2.4G.exe --bt           # 列出蓝牙设备及其连接状态
     2.4G.exe --panel        # 打开面板（不常驻托盘）
     2.4G.exe --install      # 创建开机自启 + 桌面入口
 
@@ -572,6 +572,7 @@ class Reading:
     ts: float = dataclasses.field(default_factory=time.time)
     present: bool = True     # 设备接口是否存在（False = 真的没插）
     stale: bool = False      # True = 本次没读到，用的是上次成功值
+    via_bt: bool = False     # True = 读数来自蓝牙电池服务（不是 HID）
     vid: int = 0
     pid: int = 0
     usage_page: int = 0
@@ -1293,6 +1294,7 @@ foreach ($d in $devs) {
     if (-not $bt) { continue }
 
     $level = $null
+    $modeUsed = ""
     foreach ($mode in @([Windows.Devices.Bluetooth.BluetoothCacheMode]::Uncached,
                         [Windows.Devices.Bluetooth.BluetoothCacheMode]::Cached)) {
         if ($null -ne $level) { break }
@@ -1317,13 +1319,16 @@ foreach ($d in $devs) {
                         })[0]
                         $val = [int]($mi.Invoke($null, @($vRes.Value))[0])
                     }
-                    if ($null -ne $val) { $level = $val; break }
+                    if ($null -ne $val) { $level = $val; $modeUsed = $mode.ToString(); break }
                 }
             }
         }
         catch { }
     }
-    if ($null -ne $level) { Write-Output ("BT|" + $d.Name + "|" + $level) }
+    # Always emit one line: the connection status decides whether to show the
+    # device at all. A disconnected device may still have a cached level.
+    $lvlOut = if ($null -ne $level) { [string]$level } else { "" }
+    Write-Output ("BT|" + $d.Name + "|" + $lvlOut + "|" + $bt.ConnectionStatus + "|" + $modeUsed)
 }
 """
 
@@ -1332,10 +1337,11 @@ BT_CACHE_TTL = 90.0
 
 
 def _bt_scan(match: str = "", force: bool = False, timeout: int = 0) -> dict:
-    """跑一次 PowerShell 拿已配对蓝牙设备的电量，返回 {名称: 百分比}。
+    """跑一次 PowerShell 拿已配对蓝牙设备的状态，返回 {名称: (电量|None, 是否已连接)}。
 
-    Windows 缓存的 GATT 值在蓝牙链路断开时也读得到，所以键盘用 2.4G 时
-    依然能拿到上次的电量。带 match 时只连目标设备（快得多）。
+    电量可能来自 Windows 缓存的 GATT（蓝牙链路断开时也有值），所以
+    **是否显示要看第二个元素**，不能只看有没有电量。
+    带 match 时只连目标设备（快得多）。
     """
     if not timeout:
         timeout = 40 if match else 180
@@ -1371,29 +1377,41 @@ def _bt_scan(match: str = "", force: bool = False, timeout: int = 0) -> dict:
         if not line.startswith("BT|"):
             continue
         parts = line.split("|")
-        if len(parts) >= 3:
+        if len(parts) < 4:
+            continue
+        lvl = None
+        if parts[2].strip():
             try:
-                data[parts[1]] = int(parts[2])
+                lvl = int(parts[2])
             except ValueError:
-                pass
+                lvl = None
+        connected = parts[3].strip().lower() == "connected"
+        data[parts[1]] = (lvl, connected)
     if data:
         _BT_CACHE["data"] = data
         _BT_CACHE["t"] = time.time()
     return data
 
 
-def bt_read(match: str) -> Optional[Reading]:
-    """按设备名（子串）从蓝牙电池服务读电量。"""
+def bt_read(match: str) -> Reading:
+    """按设备名（子串）读蓝牙电量。只有蓝牙链路已连接时才认为读到了。"""
+    src = "蓝牙电池服务（0x180F）"
     data = _bt_scan(match)
     if not data:
-        return Reading(ok=False, source="蓝牙电池服务（0x180F）",
+        return Reading(ok=False, source=src, via_bt=True, present=False,
                        detail=f"没有匹配 {match!r} 的已配对蓝牙设备")
-    for name, level in data.items():
-        if not match or match.lower() in name.lower():
-            return Reading(ok=True, level=_clamp(level),
-                           source="蓝牙电池服务（0x180F）",
-                           detail=f"{name}（Windows 缓存）")
-    return Reading(ok=False, source="蓝牙电池服务（0x180F）",
+    for name, (lvl, connected) in data.items():
+        if match and match.lower() not in name.lower():
+            continue
+        if not connected:
+            return Reading(ok=False, source=src, via_bt=True, present=False,
+                           detail=f"{name} 蓝牙未连接")
+        if lvl is None:
+            return Reading(ok=False, source=src, via_bt=True, present=False,
+                           detail=f"{name} 已连接但读不到电量")
+        return Reading(ok=True, level=_clamp(lvl), source=src, via_bt=True,
+                       present=True, detail=f"{name}（蓝牙已连接）")
+    return Reading(ok=False, source=src, via_bt=True, present=False,
                    detail=f"没有匹配 {match!r} 的已配对蓝牙设备")
 
 
@@ -1426,7 +1444,9 @@ def _bt_guess(product: str):
     if not data:
         return None, None
     best = None
-    for nm, lvl in data.items():
+    for nm, (lvl, connected) in data.items():
+        if not connected or lvl is None:      # 没连上就不算识别成功
+            continue
         low = nm.lower()
         hit = sum(1 for t in tokens[:3] if t.lower() in low)
         if hit >= 2 and (best is None or hit > best[0]):
@@ -1435,8 +1455,8 @@ def _bt_guess(product: str):
         return None, None
     _, nm, lvl = best
     r = Reading(ok=True, level=_clamp(lvl),
-                source="蓝牙电池服务（0x180F）",
-                detail=f"{nm}（按产品名匹配）")
+                source="蓝牙电池服务（0x180F）", via_bt=True, present=True,
+                detail=f"{nm}（蓝牙已连接）")
     return r, nm
 
 
@@ -1461,22 +1481,13 @@ def _read_bt_device(dev: dict, proto: dict, ifaces) -> Reading:
     keys = ("match", "bt_name", "source_name")
     match = next((proto.get(k) for k in keys if proto.get(k)), None) or name
     r = bt_read(match)
-    cand = [d for d in ifaces if d.vid == vid and d.pid == pid]
     r.name = name
     r.vid, r.pid = vid, pid
-    if r.ok:
-        r.present = True
-        r.status = "unknown"
-    elif cand:
-        r.present = True
-        r.status = "asleep"
-    else:
-        r.present = False
-        r.status = "unplugged"
-    r.hid_known = bool(cand)
-    if cand:
-        meta = next((d for d in cand if d.usage_page >= 0xFF00), cand[0])
-        r.usage_page = meta.usage_page
+    # 蓝牙设备“在不在”取决于蓝牙链路是否连着：
+    # 断开时即使 Windows 缓存里还有电量，也不显示。
+    r.present = bool(r.ok)
+    r.status = "unknown" if r.ok else "disconnected"
+    r.hid_known = False
     return r
 
 
@@ -1764,7 +1775,7 @@ def apply_last_known(res: dict[str, Reading]) -> dict[str, Reading]:
             out[key] = r
             continue
         if ((not r.ok) and key in last
-                and r.status not in ("unknown_proto", "unplugged")):
+                and r.status not in ("unknown_proto", "unplugged", "disconnected")):
             item = last[key]
             try:
                 level = int(item.get("level"))
@@ -3132,13 +3143,20 @@ def _probe_royuan(d):
 
 
 def print_bt(verbose: bool = False):
-    """列出所有已配对蓝牙设备的电量（含 Windows 缓存读数）。"""
+    """列出所有已配对蓝牙设备的连接状态与电量。"""
     data = _bt_scan(force=True)
     if not data:
-        print("没有可从蓝牙电池服务读到电量的已配对设备")
+        print("没有可从蓝牙电池服务读到状态的已配对设备")
         return
-    for name, level in sorted(data.items(), key=lambda kv: -kv[1]):
-        print(f"{name}：{level}%")
+    for name, (lvl, conn) in sorted(data.items(),
+                                    key=lambda kv: (not kv[1][1], kv[0])):
+        state = "已连接" if conn else "未连接"
+        if lvl is None:
+            print(f"{name}：--（{state}）")
+        elif conn:
+            print(f"{name}：{lvl}%（{state}）")
+        else:
+            print(f"{name}：{lvl}%（{state}，缓存值，不参与显示）")
 
 
 def _cli_stdio():
@@ -3191,8 +3209,9 @@ def main(argv):
     if "--probe" in argv:
         probe_devices()
         print("\n--- 蓝牙电池服务 ---")
-        for nm, lv in sorted(_bt_scan(force=True).items()):
-            print(f"  {nm}: {lv}%")
+        for nm, (lv, conn) in sorted(_bt_scan(force=True).items()):
+            print(f"  {nm}: {'--' if lv is None else str(lv) + '%'}"
+                  f"  {'已连接' if conn else '未连接'}")
         return 0
     if "--bt" in argv:
         print_bt()
@@ -4707,7 +4726,10 @@ class Panel:
         cv.create_rectangle(0, 0, W, H, fill=_rgb(self.DSH_BG), outline="")
 
         snap = self.app.snapshot()
-        keys = list(snap.keys())
+        # 蓝牙设备只在蓝牙链路连着时显示（断开时即使有缓存电量也不显示）；
+        # HID 设备仍照常显示“未连接”状态。
+        keys = [k for k, r in snap.items()
+                if r is not None and not (r.via_bt and not r.present)]
         self._card_rects = {}
         content = (len(keys) * 134 - 12) if keys else 122
         self._max_scroll = max(0.0, content - 256.0)
