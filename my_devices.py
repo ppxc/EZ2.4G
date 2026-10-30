@@ -1198,6 +1198,68 @@ def save_vendor_protocol(vid: int, pid: int, kind: str) -> None:
         save_config(cfg)
 
 
+def result_label(level, charging):
+    """把厂商返回的电量/充电字节转成状态文字。"""
+    if charging:
+        return "charging"
+    return "unknown"
+
+
+def vgn_read(iface: HidIface, timeout: float = 1.0) -> Optional[Reading]:
+    """VGN / VXE 系 2.4G dongle 的厂商协议（WsServe）。
+
+    通道是 usage page 0xFF1C 的厂商集合（64 字节进 / 64 字节出），
+    report id 4。请求负载：
+
+        00 00 1A 06 00 00 00        # 0x1A = GetBatterLevel
+
+    线上帧为 `04 00 00 1A 06 00 00 00` 后补零到报告长度。
+    回包第 3 字节回显 0x1A，电量在第 8 字节、充电状态在第 9 字节
+    （官方代码里 monitorData 不含 report id，所以是 7/8，线上加 1）。
+
+    协议取自 VGN VHUB 的 `WsServe.getElectricQuantity()` 与 `readBuffer()`。
+    """
+    src = "VGN 2.4G 协议（0xFF1C，命令 0x1A）"
+    if iface.usage_page != 0xFF1C:
+        return None
+    if iface.input_len < 16 or iface.output_len < 8:
+        return None
+    frame = bytes([0x04, 0x00, 0x00, 0x1A, 0x06, 0x00, 0x00, 0x00])
+    total = iface.output_len
+    try:
+        dev = HidDevice(iface.path, write=True)
+    except HidError as e:
+        return Reading(ok=False, source=src, detail=str(e))
+    try:
+        for _ in range(2):
+            dev.drain()
+            time.sleep(0.05)
+            try:
+                dev.write_output(frame + bytes(total - len(frame)))
+            except HidError as e:
+                return Reading(ok=False, source=src, detail=str(e))
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                rep = dev.read_input(iface.input_len, 250)
+                if not rep or len(rep) < 10:
+                    continue
+                # 回包必须回显命令，否则是别的报文（回声/无关事件）
+                if rep[3] != 0x1A and rep[2] != 0x1A:
+                    continue
+                level = rep[8]
+                if level > 100:
+                    continue        # 无效帧，别当成电量
+                charging = rep[9]
+                return Reading(ok=True, level=_clamp(level),
+                               status=result_label(level, charging),
+                               source=src,
+                               detail=f"充电状态字节={charging}", raw=rep)
+        return Reading(ok=False, source=src,
+                       detail="dongle 无应答（键盘可能已关机或不在 2.4G 档）")
+    finally:
+        dev.close()
+
+
 def save_sc525_protocol(vid: int, pid: int) -> None:
     """兼容旧调用：等价于 save_vendor_protocol(vid, pid, "sc525")。"""
     save_vendor_protocol(vid, pid, "sc525")
@@ -1503,9 +1565,10 @@ def read_saved_device(dev: dict, ifaces=None) -> Reading:
         return _read_bt_device(dev, _bt, ifaces)
     cand = [d for d in ifaces if d.vid == vid and d.pid == pid]
     if not cand:
-        # 设备没插：如果没登记过协议，先按名字试试蓝牙（三模设备拔了
-        # dongle 也能从 Windows 缓存的蓝牙电池服务读到电量）
-        if key not in user_protocols():
+        # 设备没插：没登记协议、或登记的是 2.4G（dongle 拔了）时，
+        # 都先按名字试试蓝牙（三模设备拔了 dongle 也能读到缓存电量）
+        _k = (user_protocols().get(key) or {}).get("kind")
+        if _k in (None, "vgn"):
             guess, matched = _bt_guess(name or f"{vid:04X}:{pid:04X}")
             if guess is not None:
                 if matched:
@@ -1529,7 +1592,7 @@ def read_saved_device(dev: dict, ifaces=None) -> Reading:
     kind = (proto or {}).get("kind", "captured")
     r = None
     sc525_fail = None
-    if kind not in ("sc525", "royuan"):
+    if kind not in ("sc525", "royuan", "vgn"):
         # 标准 HID 直接读
         for d in cand:
             try:
@@ -1572,6 +1635,18 @@ def read_saved_device(dev: dict, ifaces=None) -> Reading:
                 if rr is not None and rr.ok and rr.level is not None:
                     r = rr
                     break
+    if not r or not r.ok:
+        # VGN / VXE 系 2.4G dongle：usage page 0xFF1C，命令 0x1A
+        for d in cand:
+            try:
+                rr = vgn_read(d)
+            except Exception:
+                rr = None
+            if rr is not None and rr.ok and rr.level is not None:
+                r = rr
+                break
+            if rr is not None and not rr.ok and not (r and r.ok):
+                r = rr
     if r is not None and r.ok and proto is None:
         # 记住这个设备走的是哪条协议：以后读不到时按“休眠”处理，
         # 托盘图标保留上次电量，而不是整块消失
@@ -1579,6 +1654,8 @@ def read_saved_device(dev: dict, ifaces=None) -> Reading:
             save_vendor_protocol(vid, pid, "sc525")
         elif r.source.startswith("ROYUAN"):
             save_vendor_protocol(vid, pid, "royuan")
+        elif r.source.startswith("VGN"):
+            save_vendor_protocol(vid, pid, "vgn")
         else:
             save_standard_protocol(vid, pid)
     supported = key in user_protocols()
@@ -1609,12 +1686,19 @@ def read_saved_device(dev: dict, ifaces=None) -> Reading:
             r.source = "SC525 协议（0xFF0F，命令 0x20）"
         elif kind == "royuan":
             r.source = "ROYUAN 协议（0xF7）"
+        elif kind == "vgn":
+            r.source = "VGN 2.4G 协议（0xFF1C，命令 0x1A）"
         else:
             r.source = "抓包协议"
         if not r.detail:
             r.detail = "设备休眠"
     r.name = name
-    r.present = True
+    if kind == "vgn" and not r.ok:
+        # 2.4G：dongle 不应答 = 键盘关机或不在 2.4G 档，按“未连接”处理，不显示
+        r.status = "disconnected"
+        r.present = False
+    else:
+        r.present = True
     meta = next((d for d in cand if d.usage_page >= 0xFF00), cand[0])
     r.vid, r.pid = vid, pid
     r.usage_page = meta.usage_page
@@ -3101,6 +3185,13 @@ def probe_devices():
             _probe_sc525(d)
         elif d.usage_page == 0xFFFF and d.feature_len >= 64:
             _probe_royuan(d)
+        elif d.usage_page == 0xFF1C:
+            r = vgn_read(d)
+            if r is None:
+                print("   VGN 0x1A：集合形状不符，未尝试")
+            else:
+                print(f"   VGN 0x1A → ok={r.ok} level={r.level} "
+                      f"status={r.status!r} detail={r.detail}")
 
 
 def _probe_sc525(d):
